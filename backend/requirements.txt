@@ -1,5 +1,5 @@
 fastapi[standard]
-uvicorn
+uvicorn[standard]
 pyjwt
 pwdlib[argon2]
 pandas
