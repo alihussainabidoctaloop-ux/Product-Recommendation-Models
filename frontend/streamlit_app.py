@@ -1,9 +1,14 @@
+import base64
+import io
+import json
 from typing import Any, Dict, Optional
 
+import openai  # <-- NEW
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from PIL import Image
 
 # ------------------------------
 # Session state
@@ -27,11 +32,20 @@ st.set_page_config(
 # ------------------------------
 # CONSTANTS
 # ------------------------------
-RECOMMENDATION_TRESHOLD: float = 0.80
+NLP_RECOMMENDATION_TRESHOLD: float = 0.80
+
+# ------------------------------
+# NEW: OpenAI client setup
+# ------------------------------
+try:
+    openai_client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+except KeyError:
+    st.error("Missing OpenAI API key. Please set OPENAI_API_KEY in Streamlit secrets.")
+    openai_client = None
 
 
 # ------------------------------
-# Helper functions
+# Helper functions (existing + new)
 # ------------------------------
 def get_headers() -> Dict[str, str]:
     headers = {}
@@ -54,7 +68,6 @@ def api_request(
             response = requests.get(url, headers=headers, params=data)
         elif method == "POST":
             if files:
-                # Let requests set multipart boundary; do not set Content-Type manually
                 response = requests.post(url, headers=headers, data=data, files=files)
             else:
                 response = requests.post(url, headers=headers, data=data)
@@ -101,7 +114,7 @@ def classify_image(image_file) -> Optional[Dict]:
     files = {
         "uploaded_image": (
             image_file.name,
-            image_file.getvalue(),  # read bytes
+            image_file.getvalue(),
             image_file.type if image_file.type else "image/jpeg",
         )
     }
@@ -118,7 +131,78 @@ def get_model_info() -> Optional[Dict]:
 
 
 # ------------------------------
-# Sidebar: Authentication
+# NEW: OpenAI filter functions
+# ------------------------------
+def image_to_base64(image_pil: Image.Image) -> str:
+    """Convert PIL image to base64 string for API."""
+    buffer = io.BytesIO()
+    image_pil.save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def is_image_valid(uploaded_file) -> tuple[bool, str]:
+    """
+    Returns (is_valid, reason) using GPT-4o.
+    Uses your exact prompt.
+    """
+    if openai_client is None:
+        return False, "OpenAI API key not configured."
+
+    # Open and convert to PIL
+    image_pil = Image.open(uploaded_file)
+    base64_img = image_to_base64(image_pil)
+
+    # Your exact system prompt
+    system_prompt = """
+You are an expert image classifier. Your job is to analyze an image and determine if it is 'valid' or 'invalid' for further processing in a backend system.
+
+An image is considered **INVALID** if it falls into any of these categories:
+- **Solid Color**: The image consists entirely of a single, uniform color (e.g., a plain white, black, or red screen).
+- **Noise**: The image is primarily random visual noise (e.g., TV static, random colorful pixels, grain).
+- **Pattern**: The image contains a simple, repeating visual pattern (e.g., a checkerboard, stripes, polka dots, a grid).
+- **Gradient**: The image is a smooth, continuous gradient between two or more colors (e.g., a sunset gradient, a linear or radial color blend).
+
+For all other images that contain discernible objects, people, scenes, complex textures, or meaningful content, classify them as **VALID**.
+
+Your response must be a JSON object with exactly these three fields:
+{
+  "verdict": "VALID" or "INVALID",
+  "reason": "A short, one-sentence explanation for your decision."
+}
+    """
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",  # or "gpt-4-turbo"
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze this image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_img}",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=150,
+        )
+        result = json.loads(response.choices[0].message.content)
+        return (result["verdict"] == "VALID", result["reason"])
+    except Exception as e:
+        st.error(f"OpenAI filter error: {e}")
+        return False, f"Filter failed: {str(e)}"
+
+
+# ------------------------------
+# Sidebar: Authentication (unchanged)
 # ------------------------------
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/shopping-cart.png", width=80)
@@ -168,14 +252,11 @@ with st.sidebar:
 # ------------------------------
 st.set_page_config(layout="wide")
 
-
 if not st.session_state.token:
     st.warning("Please log in to use the recommender.")
     st.stop()
 
-# Create 3 columns: [10%, 80%, 10%]
 left_spacer, center_column, right_spacer = st.columns([1, 8, 1])
-
 
 with center_column:
     st.title("🛍️ AI Product Recommender")
@@ -211,28 +292,39 @@ with center_column:
         elif not review_text.strip():
             st.error("Please write a product review.")
         else:
+            # ========== NEW: OpenAI filter step ==========
+            with st.spinner(
+                "🧠 Filtering image with AI (solid color, noise, pattern, gradient)..."
+            ):
+                is_valid, filter_reason = is_image_valid(uploaded_image)
+
+            if not is_valid:
+                st.error(f"❌ Image filtered out: {filter_reason}")
+                st.stop()  # Do not proceed to backend
+            else:
+                st.success(f"✅ Image passed filter: {filter_reason}")
+            # ============================================
+
+            # Continue with existing backend calls
             with st.spinner("Calling AI models..."):
                 image_result = classify_image(uploaded_image)
                 sentiment_result = analyze_sentiment(review_text)
 
+            # ... (the rest of your existing code remains exactly the same)
             if not image_result or "prediction_result" not in image_result:
                 st.error("Image classification failed. Check API logs.")
             elif not sentiment_result or "predictions" not in sentiment_result:
                 st.error("Sentiment analysis failed.")
             else:
-                # --- Correctly extract category name and confidence from new API ---
-                pred_category = image_result["prediction_result"][
-                    "category"
-                ]  # string, e.g., "Footwear"
-                img_conf = image_result["prediction_result"]["confidence"]  # float
+                pred_category = image_result["prediction_result"]["category"]
+                img_conf = image_result["prediction_result"]["confidence"]
                 categories = image_result.get("all_possible_categories", [])
 
                 sentiment = sentiment_result["predictions"].get("sentiment", "unknown")
                 sentiment_conf = sentiment_result["predictions"].get("confidence", 0.0)
 
-                # Recommendation logic (adjust threshold as needed)
                 is_recommended = (sentiment == "positive") and (
-                    img_conf > RECOMMENDATION_TRESHOLD
+                    img_conf > NLP_RECOMMENDATION_TRESHOLD
                 )
 
                 st.divider()
@@ -245,23 +337,20 @@ with center_column:
                         pred_category,
                         delta=f"Confidence: {img_conf:.1%}",
                     )
-                    with col_r2:
-                        st.metric(
-                            "Sentiment",
-                            sentiment.capitalize(),
-                            delta=f"Confidence: {sentiment_conf:.1%}",
-                        )
-                        with col_r3:
-                            if is_recommended:
-                                st.success("✅ **RECOMMENDED**")
-                                st.markdown("This product meets our criteria!")
-                            else:
-                                st.error("❌ **NOT RECOMMENDED**")
-                                st.markdown(
-                                    "Low confidence, Neutral or negative sentiment."
-                                )
+                with col_r2:
+                    st.metric(
+                        "Sentiment",
+                        sentiment.capitalize(),
+                        delta=f"Confidence: {sentiment_conf:.1%}",
+                    )
+                with col_r3:
+                    if is_recommended:
+                        st.success("✅ **RECOMMENDED**")
+                        st.markdown("This product meets our criteria!")
+                    else:
+                        st.error("❌ **NOT RECOMMENDED**")
+                        st.markdown("Low confidence, Neutral or negative sentiment.")
 
-                # Confidence bar chart
                 st.subheader("📈 Confidence Scores")
                 conf_data = pd.DataFrame(
                     {
@@ -274,19 +363,18 @@ with center_column:
                     x="Metric",
                     y="Confidence",
                     color="Metric",
-                    range_y=[0, 1],  # fixed: use range_y instead of range
+                    range_y=[0, 1],
                     text=conf_data["Confidence"].apply(lambda x: f"{x:.1%}"),
                     title="Prediction Confidence",
                 )
                 fig.add_hline(
-                    y=RECOMMENDATION_TRESHOLD,
+                    y=NLP_RECOMMENDATION_TRESHOLD,
                     line_dash="dash",
                     line_color="red",
                     annotation_text="Recommendation threshold",
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Optional: alternative predictions (image)
                 with st.expander("🔍 Alternative predictions (image)"):
                     for alt in image_result.get("alternative_predictions", []):
                         alt_name = alt.get(
